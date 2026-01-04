@@ -1,0 +1,513 @@
+import java.io.*;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+
+/**
+ * StockTradingSimulator.java
+ * Console-based stock trading simulator with OOP + CSV persistence.
+ */
+public class StockTradingSimulator {
+
+    // ======== Domain Models ========
+
+    static class Stock {
+        final String symbol;
+        final String name;
+        double price;
+        final double volatility; // e.g., 0.02 = 2% per tick
+
+        Stock(String symbol, String name, double price, double volatility) {
+            this.symbol = symbol.toUpperCase();
+            this.name = name;
+            this.price = price;
+            this.volatility = volatility;
+        }
+
+        void tick(Random rng) {
+            // Geometric Brownian-ish step
+            double drift = 0.000; // neutral drift
+            double shock = rng.nextGaussian() * volatility;
+            double change = (1 + drift + shock);
+            price = Math.max(0.01, price * change);
+        }
+
+        @Override
+        public String toString() {
+            return symbol + " (" + name + "): " + String.format("%.2f", price);
+        }
+    }
+
+    static class Market {
+        final Map<String, Stock> stocks = new LinkedHashMap<>();
+        final Random rng = new Random();
+
+        void add(Stock s) {
+            stocks.put(s.symbol, s);
+        }
+
+        Stock get(String symbol) {
+            return stocks.get(symbol.toUpperCase());
+        }
+
+        void tick() {
+            for (Stock s : stocks.values()) s.tick(rng);
+        }
+
+        void display() {
+            System.out.println("\n=== Market Prices ===");
+            System.out.printf("%-8s %-24s %10s%n", "Symbol", "Name", "Price");
+            for (Stock s : stocks.values()) {
+                System.out.printf("%-8s %-24s %10.2f%n", s.symbol, s.name, s.price);
+            }
+        }
+    }
+
+    static class Position {
+        final String symbol;
+        int quantity;
+        double avgCost; // weighted average cost
+
+        Position(String symbol, int quantity, double avgCost) {
+            this.symbol = symbol.toUpperCase();
+            this.quantity = quantity;
+            this.avgCost = avgCost;
+        }
+    }
+
+    static class Transaction {
+        final LocalDateTime time;
+        final String type; // BUY / SELL
+        final String symbol;
+        final int quantity;
+        final double price;
+        final double amount; // quantity * price (no fees modeled)
+        final double cashAfter;
+
+        Transaction(LocalDateTime time, String type, String symbol, int quantity, double price, double cashAfter) {
+            this.time = time;
+            this.type = type;
+            this.symbol = symbol.toUpperCase();
+            this.quantity = quantity;
+            this.price = price;
+            this.amount = quantity * price;
+            this.cashAfter = cashAfter;
+        }
+    }
+
+    static class PortfolioSnapshot {
+        final LocalDateTime time;
+        final double totalValue;
+
+        PortfolioSnapshot(LocalDateTime time, double totalValue) {
+            this.time = time;
+            this.totalValue = totalValue;
+        }
+    }
+
+    static class Portfolio {
+        double cash;
+        final Map<String, Position> positions = new LinkedHashMap<>();
+        final List<Transaction> transactions = new ArrayList<>();
+        final List<PortfolioSnapshot> history = new ArrayList<>();
+        final double initialDeposit;
+
+        Portfolio(double initialCash) {
+            this.cash = initialCash;
+            this.initialDeposit = initialCash;
+        }
+
+        double getPositionsValue(Market mkt) {
+            double total = 0;
+            for (Position p : positions.values()) {
+                Stock s = mkt.get(p.symbol);
+                if (s != null) total += p.quantity * s.price;
+            }
+            return total;
+        }
+
+        double getTotalValue(Market mkt) {
+            return cash + getPositionsValue(mkt);
+        }
+
+        void snapshot(Market mkt) {
+            history.add(new PortfolioSnapshot(LocalDateTime.now(), getTotalValue(mkt)));
+        }
+
+        boolean buy(Market mkt, String symbol, int qty) {
+            if (qty <= 0) return false;
+            Stock s = mkt.get(symbol);
+            if (s == null) return false;
+            double cost = qty * s.price;
+            if (cost > cash) return false;
+
+            Position p = positions.getOrDefault(s.symbol, new Position(s.symbol, 0, 0));
+            double newQty = p.quantity + qty;
+            double newAvg = (p.quantity * p.avgCost + qty * s.price) / newQty;
+            p.quantity += qty;
+            p.avgCost = newAvg;
+            positions.put(s.symbol, p);
+
+            cash -= cost;
+            transactions.add(new Transaction(LocalDateTime.now(), "BUY", s.symbol, qty, s.price, cash));
+            return true;
+        }
+
+        boolean sell(Market mkt, String symbol, int qty) {
+            if (qty <= 0) return false;
+            Position p = positions.get(symbol.toUpperCase());
+            Stock s = mkt.get(symbol);
+            if (p == null || s == null || qty > p.quantity) return false;
+
+            double proceeds = qty * s.price;
+            p.quantity -= qty;
+            if (p.quantity == 0) p.avgCost = 0; // reset if fully closed
+            positions.put(p.symbol, p);
+
+            cash += proceeds;
+            transactions.add(new Transaction(LocalDateTime.now(), "SELL", s.symbol, qty, s.price, cash));
+            return true;
+        }
+
+        double roiPct(Market mkt) {
+            double total = getTotalValue(mkt);
+            return (total - initialDeposit) / initialDeposit * 100.0;
+        }
+    }
+
+    static class User {
+        final String name;
+        final Portfolio portfolio;
+
+        User(String name, double initialCash) {
+            this.name = name;
+            this.portfolio = new Portfolio(initialCash);
+        }
+    }
+
+    // ======== Persistence (CSV) ========
+
+    static class Persistence {
+        private static final DateTimeFormatter TS = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+
+        static void save(User user, Market mkt, String basename) {
+            savePortfolio(user, basename + "_portfolio.csv");
+            saveTransactions(user, basename + "_transactions.csv");
+            saveHistory(user, basename + "_history.csv");
+            System.out.println("Saved to files with base: " + basename + "_*.csv");
+        }
+
+        static void load(User user, String basename) {
+            loadPortfolio(user, basename + "_portfolio.csv");
+            loadTransactions(user, basename + "_transactions.csv");
+            loadHistory(user, basename + "_history.csv");
+            System.out.println("Loaded from files with base: " + basename + "_*.csv");
+        }
+
+        private static void savePortfolio(User user, String path) {
+            try (PrintWriter pw = new PrintWriter(new FileWriter(path))) {
+                pw.println("cash,initialDeposit");
+                pw.printf(Locale.US, "%.4f,%.4f%n", user.portfolio.cash, user.portfolio.initialDeposit);
+                pw.println("symbol,quantity,avgCost");
+                for (Position p : user.portfolio.positions.values()) {
+                    pw.printf(Locale.US, "%s,%d,%.4f%n", p.symbol, p.quantity, p.avgCost);
+                }
+            } catch (IOException e) {
+                System.out.println("Error saving portfolio: " + e.getMessage());
+            }
+        }
+
+        private static void loadPortfolio(User user, String path) {
+            File f = new File(path);
+            if (!f.exists()) {
+                System.out.println("Portfolio file not found: " + path);
+                return;
+            }
+            try (BufferedReader br = new BufferedReader(new FileReader(path))) {
+                String line;
+                // cash header
+                br.readLine();
+                line = br.readLine();
+                if (line != null) {
+                    String[] parts = line.split(",");
+                    user.portfolio.cash = Double.parseDouble(parts[0]);
+                    // initialDeposit is fixed at construction; leave it as-is
+                }
+                // positions header
+                br.readLine();
+                user.portfolio.positions.clear();
+                while ((line = br.readLine()) != null) {
+                    String[] parts = line.split(",");
+                    if (parts.length < 3) continue;
+                    String sym = parts[0].trim();
+                    int qty = Integer.parseInt(parts[1].trim());
+                    double avg = Double.parseDouble(parts[2].trim());
+                    user.portfolio.positions.put(sym, new Position(sym, qty, avg));
+                }
+            } catch (Exception e) {
+                System.out.println("Error loading portfolio: " + e.getMessage());
+            }
+        }
+
+        private static void saveTransactions(User user, String path) {
+            try (PrintWriter pw = new PrintWriter(new FileWriter(path))) {
+                pw.println("time,type,symbol,quantity,price,amount,cashAfter");
+                for (Transaction t : user.portfolio.transactions) {
+                    pw.printf(Locale.US, "%s,%s,%s,%d,%.4f,%.4f,%.4f%n",
+                            t.time.format(TS), t.type, t.symbol, t.quantity, t.price, t.amount, t.cashAfter);
+                }
+            } catch (IOException e) {
+                System.out.println("Error saving transactions: " + e.getMessage());
+            }
+        }
+
+        private static void loadTransactions(User user, String path) {
+            File f = new File(path);
+            if (!f.exists()) {
+                System.out.println("Transactions file not found: " + path);
+                return;
+            }
+            try (BufferedReader br = new BufferedReader(new FileReader(path))) {
+                String line = br.readLine(); // header
+                user.portfolio.transactions.clear();
+                while ((line = br.readLine()) != null) {
+                    String[] parts = splitCsv(line, 7);
+                    LocalDateTime ts = LocalDateTime.parse(parts[0], TS);
+                    String type = parts[1];
+                    String sym = parts[2];
+                    int qty = Integer.parseInt(parts[3]);
+                    double price = Double.parseDouble(parts[4]);
+                    double cashAfter = Double.parseDouble(parts[6]);
+                    user.portfolio.transactions.add(new Transaction(ts, type, sym, qty, price, cashAfter));
+                }
+            } catch (Exception e) {
+                System.out.println("Error loading transactions: " + e.getMessage());
+            }
+        }
+
+        private static void saveHistory(User user, String path) {
+            try (PrintWriter pw = new PrintWriter(new FileWriter(path))) {
+                pw.println("time,totalValue");
+                for (PortfolioSnapshot s : user.portfolio.history) {
+                    pw.printf(Locale.US, "%s,%.4f%n", s.time.format(TS), s.totalValue);
+                }
+            } catch (IOException e) {
+                System.out.println("Error saving history: " + e.getMessage());
+            }
+        }
+
+        private static void loadHistory(User user, String path) {
+            File f = new File(path);
+            if (!f.exists()) {
+                System.out.println("History file not found: " + path);
+                return;
+            }
+            try (BufferedReader br = new BufferedReader(new FileReader(path))) {
+                String line = br.readLine(); // header
+                user.portfolio.history.clear();
+                while ((line = br.readLine()) != null) {
+                    String[] parts = splitCsv(line, 2);
+                    LocalDateTime ts = LocalDateTime.parse(parts[0], TS);
+                    double val = Double.parseDouble(parts[1]);
+                    user.portfolio.history.add(new PortfolioSnapshot(ts, val));
+                }
+            } catch (Exception e) {
+                System.out.println("Error loading history: " + e.getMessage());
+            }
+        }
+
+        private static String[] splitCsv(String line, int expected) {
+            // Simple CSV split (no quoted commas support); sufficient for our data.
+            String[] parts = line.split(",", -1);
+            if (parts.length < expected) {
+                String[] out = new String[expected];
+                System.arraycopy(parts, 0, out, 0, parts.length);
+                for (int i = parts.length; i < expected; i++) out[i] = "";
+                return out;
+            }
+            return parts;
+        }
+    }
+
+    // ======== App (Console UI) ========
+
+    private static final Scanner SC = new Scanner(System.in);
+
+    public static void main(String[] args) {
+        Market market = seedMarket();
+        User user = new User("Trader", 100_000.00);
+
+        System.out.println("===== Stock Trading Platform =====");
+        user.portfolio.snapshot(market); // initial snapshot
+
+        boolean running = true;
+        while (running) {
+            try {
+                System.out.println("\nMenu:");
+                System.out.println("1) Show Market");
+                System.out.println("2) Advance Market (ticks)");
+                System.out.println("3) Buy");
+                System.out.println("4) Sell");
+                System.out.println("5) View Portfolio");
+                System.out.println("6) View Performance");
+                System.out.println("7) Save (CSV)");
+                System.out.println("8) Load (CSV)");
+                System.out.println("9) Exit");
+                System.out.print("Choose: ");
+                int choice = Integer.parseInt(SC.nextLine().trim());
+
+                switch (choice) {
+                    case 1 -> market.display();
+                    case 2 -> {
+                        System.out.print("How many ticks to advance? ");
+                        int n = Integer.parseInt(SC.nextLine().trim());
+                        for (int i = 0; i < n; i++) {
+                            market.tick();
+                            user.portfolio.snapshot(market);
+                        }
+                        System.out.println("Advanced " + n + " tick(s).");
+                    }
+                    case 3 -> buyFlow(user, market);
+                    case 4 -> sellFlow(user, market);
+                    case 5 -> showPortfolio(user, market);
+                    case 6 -> showPerformance(user, market);
+                    case 7 -> {
+                        System.out.print("Base filename (e.g., mydata): ");
+                        String base = SC.nextLine().trim();
+                        if (!base.isEmpty()) Persistence.save(user, market, base);
+                        else System.out.println("Filename required.");
+                    }
+                    case 8 -> {
+                        System.out.print("Base filename to load (e.g., mydata): ");
+                        String base = SC.nextLine().trim();
+                        if (!base.isEmpty()) Persistence.load(user, base);
+                        else System.out.println("Filename required.");
+                    }
+                    case 9 -> {
+                        System.out.println("Goodbye!");
+                        running = false;
+                    }
+                    default -> System.out.println("Invalid option.");
+                }
+            } catch (Exception e) {
+                System.out.println("Input error: " + e.getMessage());
+            }
+        }
+    }
+
+    private static Market seedMarket() {
+        Market m = new Market();
+        m.add(new Stock("AAPL", "Apple Inc.", 195.00, 0.012));
+        m.add(new Stock("GOOG", "Alphabet Inc.", 145.00, 0.013));
+        m.add(new Stock("AMZN", "Amazon.com Inc.", 180.00, 0.015));
+        m.add(new Stock("MSFT", "Microsoft Corp.", 420.00, 0.011));
+        m.add(new Stock("TSLA", "Tesla Inc.", 245.00, 0.025));
+        m.add(new Stock("NVDA", "NVIDIA Corp.", 124.00, 0.020));
+        return m;
+    }
+
+    private static void buyFlow(User user, Market market) {
+        System.out.print("Symbol to BUY: ");
+        String sym = SC.nextLine().trim().toUpperCase();
+        Stock s = market.get(sym);
+        if (s == null) {
+            System.out.println("Unknown symbol.");
+            return;
+        }
+        System.out.println("Price: " + String.format("%.2f", s.price));
+        System.out.print("Quantity: ");
+        int qty = Integer.parseInt(SC.nextLine().trim());
+
+        boolean ok = user.portfolio.buy(market, sym, qty);
+        if (ok) {
+            System.out.println("Bought " + qty + " " + sym + " @ " + String.format("%.2f", s.price));
+            user.portfolio.snapshot(market);
+        } else {
+            System.out.println("Buy failed (insufficient cash or invalid qty).");
+        }
+    }
+
+    private static void sellFlow(User user, Market market) {
+        System.out.print("Symbol to SELL: ");
+        String sym = SC.nextLine().trim().toUpperCase();
+        Stock s = market.get(sym);
+        if (s == null) {
+            System.out.println("Unknown symbol.");
+            return;
+        }
+        System.out.println("Price: " + String.format("%.2f", s.price));
+        System.out.print("Quantity: ");
+        int qty = Integer.parseInt(SC.nextLine().trim());
+
+        boolean ok = user.portfolio.sell(market, sym, qty);
+        if (ok) {
+            System.out.println("Sold " + qty + " " + sym + " @ " + String.format("%.2f", s.price));
+            user.portfolio.snapshot(market);
+        } else {
+            System.out.println("Sell failed (not enough shares or invalid qty).");
+        }
+    }
+
+    private static void showPortfolio(User user, Market market) {
+        System.out.println("\n=== Portfolio ===");
+        System.out.printf("Cash: $%.2f%n", user.portfolio.cash);
+        System.out.println("\nPositions:");
+        if (user.portfolio.positions.isEmpty()) {
+            System.out.println("(none)");
+        } else {
+            System.out.printf("%-8s %10s %12s %12s %12s%n",
+                    "Symbol", "Qty", "Avg Cost", "Mkt Price", "Market Val");
+            for (Position p : user.portfolio.positions.values()) {
+                Stock s = market.get(p.symbol);
+                double price = (s != null) ? s.price : 0.0;
+                double mval = p.quantity * price;
+                System.out.printf("%-8s %10d %12.2f %12.2f %12.2f%n",
+                        p.symbol, p.quantity, p.avgCost, price, mval);
+            }
+        }
+        double posVal = user.portfolio.getPositionsValue(market);
+        double total = user.portfolio.getTotalValue(market);
+        System.out.printf("%nPositions Value: $%.2f%n", posVal);
+        System.out.printf("Total Value    : $%.2f%n", total);
+    }
+
+    private static void showPerformance(User user, Market market) {
+        System.out.println("\n=== Performance ===");
+        double total = user.portfolio.getTotalValue(market);
+        double roi = user.portfolio.roiPct(market);
+        System.out.printf("Current Total Value: $%.2f%n", total);
+        System.out.printf("ROI vs Initial Cash: %.2f%%%n", roi);
+
+        System.out.println("\nValue History (latest 10):");
+        int start = Math.max(0, user.portfolio.history.size() - 10);
+        for (int i = start; i < user.portfolio.history.size(); i++) {
+            PortfolioSnapshot snap = user.portfolio.history.get(i);
+            System.out.printf("%s  $%.2f%n", snap.time.toString().replace('T', ' '), snap.totalValue);
+        }
+
+        // ASCII sparkline-ish
+        if (user.portfolio.history.size() >= 2) {
+            System.out.println("\nASCII Chart:");
+            asciiChart(user.portfolio.history);
+        }
+    }
+
+    private static void asciiChart(List<PortfolioSnapshot> hist) {
+        int n = Math.min(hist.size(), 60);
+        double min = Double.MAX_VALUE, max = -Double.MAX_VALUE;
+        for (int i = hist.size() - n; i < hist.size(); i++) {
+            double v = hist.get(i).totalValue;
+            min = Math.min(min, v);
+            max = Math.max(max, v);
+        }
+        double range = Math.max(1e-9, max - min);
+        for (int i = hist.size() - n; i < hist.size(); i++) {
+            double v = hist.get(i).totalValue;
+            int bars = (int) Math.round(((v - min) / range) * 50);
+            StringBuilder sb = new StringBuilder();
+            for (int b = 0; b < bars; b++) sb.append('█');
+            System.out.printf("%s | %s $%.2f%n",
+                    hist.get(i).time.toString().replace('T', ' '), sb, v);
+        }
+    }
+}

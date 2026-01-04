@@ -1,0 +1,472 @@
+import java.io.*;
+import java.nio.file.*;
+import java.time.*;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.stream.Collectors;
+
+/**
+ * HotelReservationSystem.java
+ * Console-based system with OOP + CSV persistence.
+ * Features: search, book, cancel, view details, payment simulation.
+ *
+ * How to run:
+ *   javac HotelReservationSystem.java
+ *   java HotelReservationSystem
+ */
+public class HotelReservationSystem {
+
+    // ====== Domain ======
+    enum RoomType { STANDARD, DELUXE, SUITE }
+
+    static class Room {
+        final int number;
+        final RoomType type;
+        final int capacity;
+        final double basePricePerNight;
+
+        Room(int number, RoomType type, int capacity, double basePricePerNight) {
+            this.number = number;
+            this.type = type;
+            this.capacity = capacity;
+            this.basePricePerNight = basePricePerNight;
+        }
+
+        @Override public String toString() {
+            return String.format("#%d  %-7s  cap:%d  $%.2f/nt",
+                    number, type, capacity, basePricePerNight);
+        }
+    }
+
+    enum ReservationStatus { ACTIVE, CANCELED }
+
+    static class Reservation {
+        final String id;                  // e.g., RSV-20240820-AB12
+        final String customerName;
+        final int roomNumber;
+        final LocalDate checkIn;          // inclusive
+        final LocalDate checkOut;         // exclusive
+        final int guests;
+        final double totalAmount;
+        ReservationStatus status;
+        final String paymentId;           // from PaymentGateway (may be null if failed)
+
+        Reservation(String id, String customerName, int roomNumber,
+                    LocalDate checkIn, LocalDate checkOut, int guests,
+                    double totalAmount, ReservationStatus status, String paymentId) {
+            this.id = id;
+            this.customerName = customerName;
+            this.roomNumber = roomNumber;
+            this.checkIn = checkIn;
+            this.checkOut = checkOut;
+            this.guests = guests;
+            this.totalAmount = totalAmount;
+            this.status = status;
+            this.paymentId = paymentId;
+        }
+
+        long nights() { return Duration.between(checkIn.atStartOfDay(), checkOut.atStartOfDay()).toDays(); }
+
+        @Override public String toString() {
+            return "Reservation{" +
+                    "id='" + id + '\'' +
+                    ", customer='" + customerName + '\'' +
+                    ", room=" + roomNumber +
+                    ", stay=" + checkIn + "→" + checkOut + " (" + nights() + " nts)" +
+                    ", guests=" + guests +
+                    ", total=$" + String.format("%.2f", totalAmount) +
+                    ", status=" + status +
+                    ", paymentId=" + (paymentId == null ? "-" : paymentId) +
+                    '}';
+        }
+    }
+
+    static class PaymentGateway {
+        private final Random rng = new Random();
+
+        static class PaymentResult {
+            final boolean success; final String paymentId; final String message;
+            PaymentResult(boolean success, String paymentId, String message) {
+                this.success = success; this.paymentId = paymentId; this.message = message;
+            }
+        }
+
+        PaymentResult charge(double amount, String customerName) {
+            // Simple simulation: 90% success, 10% fail
+            boolean ok = rng.nextDouble() < 0.90;
+            if (ok) {
+                String pid = "PAY-" + DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss")
+                        .format(LocalDateTime.now()) + "-" + randomAlpha(4);
+                return new PaymentResult(true, pid, "Approved");
+            } else {
+                return new PaymentResult(false, null, "Declined by bank");
+            }
+        }
+
+        private String randomAlpha(int n) {
+            String a = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < n; i++) sb.append(a.charAt(rng.nextInt(a.length())));
+            return sb.toString();
+        }
+    }
+
+    static class Hotel {
+        final String name;
+        final Map<Integer, Room> rooms = new LinkedHashMap<>();
+        final List<Reservation> reservations = new ArrayList<>();
+
+        Hotel(String name) { this.name = name; }
+
+        void addRoom(Room r) { rooms.put(r.number, r); }
+
+        List<Room> search(RoomType type, LocalDate in, LocalDate out, int guests) {
+            return rooms.values().stream()
+                    .filter(r -> r.type == type)
+                    .filter(r -> r.capacity >= guests)
+                    .filter(r -> isAvailable(r.number, in, out))
+                    .sorted(Comparator.comparingInt(rr -> rr.number))
+                    .collect(Collectors.toList());
+        }
+
+        boolean isAvailable(int roomNumber, LocalDate in, LocalDate out) {
+            // overlap if: existing.checkIn < out && in < existing.checkOut
+            for (Reservation rs : reservations) {
+                if (rs.roomNumber != roomNumber) continue;
+                if (rs.status != ReservationStatus.ACTIVE) continue;
+                boolean overlap = rs.checkIn.isBefore(out) && in.isBefore(rs.checkOut);
+                if (overlap) return false;
+            }
+            return true;
+        }
+
+        Reservation book(String customer, int roomNumber, LocalDate in, LocalDate out, int guests, PaymentGateway pg) {
+            Room r = rooms.get(roomNumber);
+            if (r == null) throw new IllegalArgumentException("Room not found.");
+            if (!isAvailable(roomNumber, in, out)) throw new IllegalStateException("Room not available.");
+            if (!in.isBefore(out)) throw new IllegalArgumentException("Check-in must be before check-out.");
+            if (guests > r.capacity) throw new IllegalArgumentException("Too many guests for this room.");
+
+            long nights = Duration.between(in.atStartOfDay(), out.atStartOfDay()).toDays();
+            if (nights <= 0) throw new IllegalArgumentException("Stay must be at least 1 night.");
+            double subtotal = r.basePricePerNight * nights;
+            double taxes = subtotal * 0.10; // 10% tax simulation
+            double total = round2(subtotal + taxes);
+
+            PaymentGateway.PaymentResult pay = pg.charge(total, customer);
+            if (!pay.success) throw new IllegalStateException("Payment failed: " + pay.message);
+
+            String id = genReservationId();
+            Reservation res = new Reservation(id, customer, roomNumber, in, out, guests, total, ReservationStatus.ACTIVE, pay.paymentId);
+            reservations.add(res);
+            return res;
+        }
+
+        boolean cancel(String reservationId) {
+            for (Reservation r : reservations) {
+                if (r.id.equalsIgnoreCase(reservationId)) {
+                    if (r.status == ReservationStatus.CANCELED) return false;
+                    r.status = ReservationStatus.CANCELED;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        Reservation find(String reservationId) {
+            for (Reservation r : reservations) if (r.id.equalsIgnoreCase(reservationId)) return r;
+            return null;
+        }
+
+        List<Reservation> allReservations() { return new ArrayList<>(reservations); }
+
+        private String genReservationId() {
+            return "RSV-" + DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss")
+                    .format(LocalDateTime.now()) + "-" + UUID.randomUUID().toString().substring(0, 6).toUpperCase();
+        }
+    }
+
+    // ====== Persistence (CSV) ======
+    static class Persistence {
+        static final DateTimeFormatter DF = DateTimeFormatter.ISO_LOCAL_DATE;
+
+        static void saveRooms(Hotel h, String path) {
+            try (PrintWriter pw = new PrintWriter(Files.newBufferedWriter(Paths.get(path)))) {
+                pw.println("number,type,capacity,basePricePerNight");
+                for (Room r : h.rooms.values()) {
+                    pw.printf(Locale.US, "%d,%s,%d,%.2f%n", r.number, r.type, r.capacity, r.basePricePerNight);
+                }
+                System.out.println("Saved rooms -> " + path);
+            } catch (IOException e) {
+                System.out.println("Save rooms failed: " + e.getMessage());
+            }
+        }
+
+        static void saveReservations(Hotel h, String path) {
+            try (PrintWriter pw = new PrintWriter(Files.newBufferedWriter(Paths.get(path)))) {
+                pw.println("id,customer,roomNumber,checkIn,checkOut,guests,total,status,paymentId");
+                for (Reservation r : h.reservations) {
+                    pw.printf(Locale.US, "%s,%s,%d,%s,%s,%d,%.2f,%s,%s%n",
+                            esc(r.id), esc(r.customerName), r.roomNumber,
+                            DF.format(r.checkIn), DF.format(r.checkOut),
+                            r.guests, r.totalAmount, r.status, esc(r.paymentId == null ? "" : r.paymentId));
+                }
+                System.out.println("Saved reservations -> " + path);
+            } catch (IOException e) {
+                System.out.println("Save reservations failed: " + e.getMessage());
+            }
+        }
+
+        static void loadRooms(Hotel h, String path) {
+            Path p = Paths.get(path);
+            if (!Files.exists(p)) { System.out.println("Rooms file not found: " + path); return; }
+            try (BufferedReader br = Files.newBufferedReader(p)) {
+                String line; br.readLine(); // header
+                h.rooms.clear();
+                while ((line = br.readLine()) != null) {
+                    String[] parts = splitCsv(line, 4);
+                    int num = Integer.parseInt(parts[0]);
+                    RoomType type = RoomType.valueOf(parts[1]);
+                    int cap = Integer.parseInt(parts[2]);
+                    double price = Double.parseDouble(parts[3]);
+                    h.addRoom(new Room(num, type, cap, price));
+                }
+                System.out.println("Loaded rooms <- " + path);
+            } catch (Exception e) {
+                System.out.println("Load rooms failed: " + e.getMessage());
+            }
+        }
+
+        static void loadReservations(Hotel h, String path) {
+            Path p = Paths.get(path);
+            if (!Files.exists(p)) { System.out.println("Reservations file not found: " + path); return; }
+            try (BufferedReader br = Files.newBufferedReader(p)) {
+                String line; br.readLine(); // header
+                h.reservations.clear();
+                while ((line = br.readLine()) != null) {
+                    String[] parts = splitCsv(line, 9);
+                    String id = unesc(parts[0]);
+                    String customer = unesc(parts[1]);
+                    int roomNo = Integer.parseInt(parts[2]);
+                    LocalDate in = LocalDate.parse(parts[3], DF);
+                    LocalDate out = LocalDate.parse(parts[4], DF);
+                    int guests = Integer.parseInt(parts[5]);
+                    double total = Double.parseDouble(parts[6]);
+                    ReservationStatus status = ReservationStatus.valueOf(parts[7]);
+                    String payment = parts[8].isEmpty() ? null : unesc(parts[8]);
+                    h.reservations.add(new Reservation(id, customer, roomNo, in, out, guests, total, status, payment));
+                }
+                System.out.println("Loaded reservations <- " + path);
+            } catch (Exception e) {
+                System.out.println("Load reservations failed: " + e.getMessage());
+            }
+        }
+
+        private static String esc(String s) {
+            String out = s.replace("\"", "\"\"");
+            if (out.contains(",") || out.contains("\"") || out.contains("\n")) out = "\"" + out + "\"";
+            return out;
+        }
+        private static String unesc(String s) {
+            if (s.startsWith("\"") && s.endsWith("\"")) s = s.substring(1, s.length() - 1).replace("\"\"", "\"");
+            return s;
+        }
+        private static String[] splitCsv(String line, int expected) {
+            List<String> cols = new ArrayList<>();
+            StringBuilder sb = new StringBuilder();
+            boolean q = false;
+            for (int i = 0; i < line.length(); i++) {
+                char c = line.charAt(i);
+                if (q) {
+                    if (c == '\"') {
+                        if (i + 1 < line.length() && line.charAt(i + 1) == '\"') { sb.append('\"'); i++; }
+                        else q = false;
+                    } else sb.append(c);
+                } else {
+                    if (c == '\"') q = true;
+                    else if (c == ',') { cols.add(sb.toString()); sb.setLength(0); }
+                    else sb.append(c);
+                }
+            }
+            cols.add(sb.toString());
+            while (cols.size() < expected) cols.add("");
+            return cols.toArray(new String[0]);
+        }
+    }
+
+    // ====== Console UI ======
+    private static final Scanner SC = new Scanner(System.in);
+    private static final DateTimeFormatter DF = DateTimeFormatter.ISO_LOCAL_DATE;
+
+    public static void main(String[] args) {
+        Hotel hotel = seedHotel();
+        PaymentGateway pg = new PaymentGateway();
+
+        // Try to load persisted data if present
+        Persistence.loadRooms(hotel, "rooms.csv");
+        Persistence.loadReservations(hotel, "reservations.csv");
+
+        System.out.println("=== " + hotel.name + " — Hotel Reservation System ===");
+        boolean run = true;
+        while (run) {
+            try {
+                menu();
+                System.out.print("Choose: ");
+                int ch = Integer.parseInt(SC.nextLine().trim());
+                switch (ch) {
+                    case 1 -> showRooms(hotel);
+                    case 2 -> searchRooms(hotel);
+                    case 3 -> makeBooking(hotel, pg);
+                    case 4 -> cancelBooking(hotel);
+                    case 5 -> viewBooking(hotel);
+                    case 6 -> listBookings(hotel);
+                    case 7 -> saveAll(hotel);
+                    case 8 -> loadAll(hotel);
+                    case 9 -> { System.out.println("Goodbye!"); run = false; }
+                    default -> System.out.println("Invalid choice.");
+                }
+            } catch (Exception e) {
+                System.out.println("Error: " + e.getMessage());
+            }
+        }
+    }
+
+    private static void menu() {
+        System.out.println("\nMenu:");
+        System.out.println("1) Show All Rooms");
+        System.out.println("2) Search Availability");
+        System.out.println("3) Book Room");
+        System.out.println("4) Cancel Reservation");
+        System.out.println("5) View Reservation Details");
+        System.out.println("6) List All Reservations");
+        System.out.println("7) Save to CSV");
+        System.out.println("8) Load from CSV");
+        System.out.println("9) Exit");
+    }
+
+    private static Hotel seedHotel() {
+        Hotel h = new Hotel("BlueSky Grand");
+        // Seed some rooms only on first run (will be overwritten by loadRooms if CSV exists)
+        int n = 101;
+        for (int i = 0; i < 10; i++) h.addRoom(new Room(n + i, RoomType.STANDARD, 2, 99.00));
+        for (int i = 0; i < 6;  i++) h.addRoom(new Room(201 + i, RoomType.DELUXE,   3, 159.00));
+        for (int i = 0; i < 4;  i++) h.addRoom(new Room(301 + i, RoomType.SUITE,    4, 249.00));
+        return h;
+    }
+
+    private static void showRooms(Hotel h) {
+        System.out.println("\n--- Rooms ---");
+        h.rooms.values().stream().sorted(Comparator.comparingInt(r -> r.number)).forEach(System.out::println);
+    }
+
+    private static void searchRooms(Hotel h) {
+        RoomType type = askRoomType();
+        LocalDate in = askDate("Check-in (YYYY-MM-DD): ");
+        LocalDate out = askDate("Check-out (YYYY-MM-DD): ");
+        int guests = askInt("Guests: ");
+
+        List<Room> avail = h.search(type, in, out, guests);
+        if (avail.isEmpty()) {
+            System.out.println("No rooms available for the given criteria.");
+        } else {
+            System.out.println("\nAvailable rooms:");
+            avail.forEach(System.out::println);
+        }
+    }
+
+    private static void makeBooking(Hotel h, PaymentGateway pg) {
+        String customer = ask("Customer name: ");
+        RoomType type = askRoomType();
+        LocalDate in = askDate("Check-in (YYYY-MM-DD): ");
+        LocalDate out = askDate("Check-out (YYYY-MM-DD): ");
+        int guests = askInt("Guests: ");
+
+        List<Room> avail = h.search(type, in, out, guests);
+        if (avail.isEmpty()) {
+            System.out.println("No rooms available. Try different dates or type.");
+            return;
+        }
+        System.out.println("\nPick a room number from available list:");
+        avail.forEach(System.out::println);
+        int roomNo = askInt("Room #: ");
+
+        try {
+            Reservation r = h.book(customer, roomNo, in, out, guests, pg);
+            System.out.println("\nBooked successfully!");
+            printReservation(r);
+        } catch (Exception e) {
+            System.out.println("Booking failed: " + e.getMessage());
+        }
+    }
+
+    private static void cancelBooking(Hotel h) {
+        String id = ask("Reservation ID to cancel: ");
+        boolean ok = h.cancel(id);
+        System.out.println(ok ? "Reservation canceled (refund simulated)." : "Cancel failed (not found or already canceled).");
+    }
+
+    private static void viewBooking(Hotel h) {
+        String id = ask("Reservation ID: ");
+        Reservation r = h.find(id);
+        if (r == null) System.out.println("Not found.");
+        else printReservation(r);
+    }
+
+    private static void listBookings(Hotel h) {
+        System.out.println("\n--- All Reservations ---");
+        if (h.allReservations().isEmpty()) System.out.println("(none)");
+        for (Reservation r : h.allReservations()) printReservation(r);
+    }
+
+    private static void saveAll(Hotel h) {
+        Persistence.saveRooms(h, "rooms.csv");
+        Persistence.saveReservations(h, "reservations.csv");
+    }
+
+    private static void loadAll(Hotel h) {
+        Persistence.loadRooms(h, "rooms.csv");
+        Persistence.loadReservations(h, "reservations.csv");
+    }
+
+    private static void printReservation(Reservation r) {
+        System.out.println("---------------------------------------------");
+        System.out.println("Reservation ID : " + r.id);
+        System.out.println("Customer       : " + r.customerName);
+        System.out.println("Room           : #" + r.roomNumber);
+        System.out.println("Stay           : " + r.checkIn + " → " + r.checkOut + " (" + r.nights() + " nights)");
+        System.out.println("Guests         : " + r.guests);
+        System.out.printf ("Total Amount   : $%.2f%n", r.totalAmount);
+        System.out.println("Status         : " + r.status);
+        System.out.println("Payment ID     : " + (r.paymentId == null ? "-" : r.paymentId));
+        System.out.println("---------------------------------------------");
+    }
+
+    // ====== Helpers ======
+    private static String ask(String prompt) {
+        System.out.print(prompt);
+        return SC.nextLine().trim();
+    }
+    private static int askInt(String prompt) {
+        while (true) {
+            try {
+                System.out.print(prompt);
+                return Integer.parseInt(SC.nextLine().trim());
+            } catch (Exception e) { System.out.println("Enter a valid number."); }
+        }
+    }
+    private static LocalDate askDate(String prompt) {
+        while (true) {
+            try {
+                System.out.print(prompt);
+                return LocalDate.parse(SC.nextLine().trim(), DF);
+            } catch (Exception e) { System.out.println("Invalid date. Use YYYY-MM-DD."); }
+        }
+    }
+    private static RoomType askRoomType() {
+        while (true) {
+            String s = ask("Room type (STANDARD/DELUXE/SUITE): ").toUpperCase(Locale.ROOT);
+            try { return RoomType.valueOf(s); } catch (Exception e) { System.out.println("Invalid type."); }
+        }
+    }
+    private static double round2(double v) { return Math.round(v * 100.0) / 100.0; }
+}

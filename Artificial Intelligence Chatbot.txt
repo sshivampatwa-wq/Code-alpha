@@ -1,0 +1,504 @@
+import javax.swing.*;
+import javax.swing.border.EmptyBorder;
+import java.awt.*;
+import java.awt.event.*;
+import java.io.*;
+import java.nio.file.*;
+import java.text.SimpleDateFormat;
+import java.util.*;
+import java.util.List;
+import java.util.stream.Collectors;
+
+/**
+ * AIChatbot.java
+ * - Swing GUI for real-time chat
+ * - NLP: tokenization, lowercasing, stopword removal
+ * - Rule-based intents
+ * - ML-ish TF-IDF FAQ retriever (cosine similarity)
+ * - Train at runtime + CSV save/load for persistence
+ *
+ * How to run:
+ *   javac AIChatbot.java
+ *   java AIChatbot
+ */
+public class AIChatbot extends JFrame {
+
+    // ======== UI ========
+    private final JTextArea chatArea = new JTextArea();
+    private final JTextField inputField = new JTextField();
+    private final JButton sendBtn = new JButton("Send");
+    private final JButton trainBtn = new JButton("Train FAQ");
+    private final JButton saveBtn = new JButton("Save FAQs");
+    private final JButton loadBtn = new JButton("Load FAQs");
+
+    // ======== Engine ========
+    private final ChatEngine engine = new ChatEngine();
+
+    public AIChatbot() {
+        super("AI Chatbot");
+
+        setDefaultCloseOperation(WindowConstants.EXIT_ON_CLOSE);
+        setSize(820, 560);
+        setLocationRelativeTo(null);
+
+        chatArea.setEditable(false);
+        chatArea.setLineWrap(true);
+        chatArea.setWrapStyleWord(true);
+
+        var scroll = new JScrollPane(chatArea);
+        scroll.setBorder(new EmptyBorder(10, 10, 10, 10));
+
+        var bottom = new JPanel(new BorderLayout(8, 8));
+        bottom.setBorder(new EmptyBorder(0, 10, 10, 10));
+        inputField.setPreferredSize(new Dimension(100, 36));
+        bottom.add(inputField, BorderLayout.CENTER);
+
+        var buttons = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
+        buttons.add(trainBtn);
+        buttons.add(loadBtn);
+        buttons.add(saveBtn);
+        buttons.add(sendBtn);
+        bottom.add(buttons, BorderLayout.EAST);
+
+        var content = new JPanel(new BorderLayout());
+        content.add(scroll, BorderLayout.CENTER);
+        content.add(bottom, BorderLayout.SOUTH);
+        setContentPane(content);
+
+        // Listeners
+        sendBtn.addActionListener(e -> onSend());
+        inputField.addActionListener(e -> onSend());
+        trainBtn.addActionListener(e -> onTrain());
+        saveBtn.addActionListener(e -> onSave());
+        loadBtn.addActionListener(e -> onLoad());
+
+        // Greet
+        appendBot("Hi! I’m your AI chatbot. Ask me something, or type 'help' for options.");
+    }
+
+    private void onSend() {
+        String msg = inputField.getText().trim();
+        if (msg.isEmpty()) return;
+        appendUser(msg);
+        inputField.setText("");
+
+        String reply = engine.respond(msg);
+        appendBot(reply);
+    }
+
+    private void onTrain() {
+        JTextField qField = new JTextField();
+        JTextField aField = new JTextField();
+        Object[] fields = {
+                "Question:", qField,
+                "Answer:",   aField
+        };
+        int ok = JOptionPane.showConfirmDialog(this, fields, "Train New FAQ", JOptionPane.OK_CANCEL_OPTION);
+        if (ok == JOptionPane.OK_OPTION) {
+            String q = qField.getText().trim();
+            String a = aField.getText().trim();
+            if (!q.isEmpty() && !a.isEmpty()) {
+                engine.faq.addExample(q, a);
+                appendBot("Learned a new FAQ. Ask me that later to test me!");
+            } else {
+                appendBot("Training canceled: both question and answer are required.");
+            }
+        }
+    }
+
+    private void onSave() {
+        String path = promptFilePath("Enter base filename (e.g., faq):");
+        if (path == null) return;
+        try {
+            engine.faq.saveCSV(path.endsWith(".csv") ? path : path + ".csv");
+            appendBot("FAQs saved.");
+        } catch (Exception ex) {
+            appendBot("Error saving FAQs: " + ex.getMessage());
+        }
+    }
+
+    private void onLoad() {
+        String path = promptFilePath("Enter CSV path to load:");
+        if (path == null) return;
+        try {
+            int n = engine.faq.loadCSV(path);
+            appendBot("Loaded " + n + " FAQ entries.");
+        } catch (Exception ex) {
+            appendBot("Error loading FAQs: " + ex.getMessage());
+        }
+    }
+
+    private String promptFilePath(String label) {
+        return JOptionPane.showInputDialog(this, label, "faq.csv");
+    }
+
+    private void appendUser(String text) {
+        chatArea.append("You: " + text + "\n");
+        chatArea.setCaretPosition(chatArea.getDocument().getLength());
+    }
+
+    private void appendBot(String text) {
+        chatArea.append("Bot: " + text + "\n\n");
+        chatArea.setCaretPosition(chatArea.getDocument().getLength());
+    }
+
+    public static void main(String[] args) {
+        SwingUtilities.invokeLater(() -> new AIChatbot().setVisible(true));
+    }
+
+    // ================== Chat Engine ==================
+
+    static class ChatEngine {
+        final NLP nlp = new NLP();
+        final FAQModel faq = new FAQModel(nlp);
+        final IntentEngine intents = new IntentEngine(nlp);
+
+        ChatEngine() {
+            intents.seedDefaults();
+            faq.seedExamples(); // some default FAQs
+        }
+
+        String respond(String userMsg) {
+            String normalized = userMsg.trim();
+
+            // 1) Rule-based intents first (fast, precise)
+            Optional<String> intent = intents.tryMatch(normalized);
+            if (intent.isPresent()) return intent.get();
+
+            // 2) FAQ retrieval via TF-IDF + cosine
+            Optional<FAQResult> res = faq.search(normalized);
+            if (res.isPresent() && res.get().similarity >= 0.25) { // adjustable threshold
+                return res.get().answer + String.format("  (match: %.2f)", res.get().similarity);
+            }
+
+            // 3) Small talk fallback + guidance
+            if (nlp.containsAny(normalized, List.of("help", "options", "what can you do"))) {
+                return helpText();
+            }
+
+            // 4) Generic fallback
+            return "I’m not sure yet. You can teach me using the 'Train FAQ' button or ask for 'help'.";
+        }
+
+        private String helpText() {
+            return """
+                   I can:
+                   • Answer trained FAQs (uses TF-IDF similarity)
+                   • Handle greetings, date/time, small talk, and simple math
+                   • Be trained live (Train FAQ) and saved/loaded (CSV)
+                   
+                   Try:
+                   - "hi", "what's the time", "calculate 12*13"
+                   - Train me: Add Q/A via button, then ask that question!
+                   """;
+        }
+    }
+
+    // ================== Rule-based Intents ==================
+
+    static class IntentEngine {
+        private final NLP nlp;
+        private final List<Rule> rules = new ArrayList<>();
+
+        IntentEngine(NLP nlp) { this.nlp = nlp; }
+
+        void seedDefaults() {
+            // Greetings
+            rules.add(new Rule(List.of("hi","hello","hey","good morning","good afternoon","good evening"),
+                    () -> random(List.of("Hello! How can I help today?",
+                                         "Hey there! What would you like to know?",
+                                         "Hi! Ask me anything or type 'help'."))));
+
+            // Date / Time
+            rules.add(new Rule(List.of("time","current time","what's the time"),
+                    () -> "Current time: " + new SimpleDateFormat("HH:mm:ss").format(new Date())));
+            rules.add(new Rule(List.of("date","today's date","what's the date"),
+                    () -> "Today is " + new SimpleDateFormat("yyyy-MM-dd").format(new Date())));
+
+            // Simple math: "calculate 12*3" / "calc 18 + 24"
+            rules.add(new Rule(List.of("calculate","calc","evaluate"),
+                    () -> "Enter like: 'calculate 12*13' or 'calc 10+5'."));
+
+            // Goodbye
+            rules.add(new Rule(List.of("bye","goodbye","see you"),
+                    () -> random(List.of("Goodbye!", "See you soon!", "Bye—chat later!"))));
+        }
+
+        Optional<String> tryMatch(String userMsg) {
+            String lower = userMsg.toLowerCase(Locale.ROOT);
+
+            // Inline math handling
+            if (lower.startsWith("calculate") || lower.startsWith("calc") || lower.startsWith("evaluate")) {
+                String expr = lower.replaceFirst("(calculate|calc|evaluate)\\s*", "");
+                try {
+                    double val = SimpleMath.eval(expr);
+                    return Optional.of(expr + " = " + stripTrailingZeros(val));
+                } catch (Exception e) {
+                    return Optional.of("I couldn't parse that math. Try 'calculate 12*13'.");
+                }
+            }
+
+            for (Rule r : rules) {
+                if (nlp.containsAny(lower, r.triggers)) {
+                    return Optional.of(r.response.get());
+                }
+            }
+            return Optional.empty();
+        }
+
+        private static String random(List<String> list) {
+            return list.get(new Random().nextInt(list.size()));
+        }
+
+        record Rule(List<String> triggers, Supplier response) {}
+        interface Supplier { String get(); }
+    }
+
+    // ================== FAQ Retrieval (TF-IDF) ==================
+
+    static class FAQModel {
+        private final NLP nlp;
+        private final List<String> questions = new ArrayList<>();
+        private final List<String> answers = new ArrayList<>();
+        private final Map<String, Double> idf = new HashMap<>();
+        private final List<Map<String, Double>> tfidfDocs = new ArrayList<>();
+        private boolean dirty = true;
+
+        FAQModel(NLP nlp) { this.nlp = nlp; }
+
+        void seedExamples() {
+            addExample("what is artificial intelligence",
+                    "Artificial Intelligence (AI) is the field of building systems that perform tasks that typically require human intelligence.");
+            addExample("what is machine learning",
+                    "Machine Learning is a subset of AI where models learn patterns from data to make predictions or decisions.");
+            addExample("how to reset my password",
+                    "Go to the account settings, choose 'Reset Password', and follow the email instructions.");
+            addExample("what languages do you support",
+                    "Right now I demonstrate English, but you can train FAQs for other languages.");
+            addExample("how to contact support",
+                    "Email support@example.com or call +1-800-555-1234 during business hours.");
+        }
+
+        void addExample(String question, String answer) {
+            questions.add(question);
+            answers.add(answer);
+            dirty = true;
+        }
+
+        Optional<FAQResult> search(String userMsg) {
+            if (questions.isEmpty()) return Optional.empty();
+            if (dirty) rebuild();
+
+            Map<String, Double> qvec = tfidf(nlp.tokens(userMsg));
+            double best = -1;
+            int idx = -1;
+            for (int i = 0; i < tfidfDocs.size(); i++) {
+                double sim = cosine(qvec, tfidfDocs.get(i));
+                if (sim > best) { best = sim; idx = i; }
+            }
+            if (idx >= 0) return Optional.of(new FAQResult(questions.get(idx), answers.get(idx), best));
+            return Optional.empty();
+        }
+
+        void saveCSV(String path) throws IOException {
+            try (PrintWriter pw = new PrintWriter(Files.newBufferedWriter(Paths.get(path)))) {
+                pw.println("question,answer");
+                for (int i = 0; i < questions.size(); i++) {
+                    pw.println(escape(questions.get(i)) + "," + escape(answers.get(i)));
+                }
+            }
+        }
+
+        int loadCSV(String path) throws IOException {
+            List<String> lines = Files.readAllLines(Paths.get(path));
+            int count = 0;
+            for (int i = 0; i < lines.size(); i++) {
+                String line = lines.get(i);
+                if (i == 0 && line.toLowerCase(Locale.ROOT).startsWith("question")) continue;
+                String[] parts = unescapeCsv(line);
+                if (parts.length >= 2) {
+                    addExample(parts[0], parts[1]);
+                    count++;
+                }
+            }
+            return count;
+        }
+
+        // ---- internals ----
+
+        private void rebuild() {
+            idf.clear();
+            tfidfDocs.clear();
+
+            List<List<String>> docs = questions.stream().map(nlp::tokens).toList();
+
+            // DF
+            Map<String, Integer> df = new HashMap<>();
+            for (List<String> doc : docs) {
+                Set<String> unique = new HashSet<>(doc);
+                for (String t : unique) df.put(t, df.getOrDefault(t, 0) + 1);
+            }
+
+            int N = docs.size();
+            for (var e : df.entrySet()) {
+                idf.put(e.getKey(), Math.log((N + 1.0) / (e.getValue() + 1.0)) + 1.0); // smooth
+            }
+
+            for (List<String> doc : docs) {
+                tfidfDocs.add(tfidf(doc));
+            }
+            dirty = false;
+        }
+
+        private Map<String, Double> tfidf(List<String> doc) {
+            Map<String, Integer> tf = new HashMap<>();
+            for (String t : doc) tf.put(t, tf.getOrDefault(t, 0) + 1);
+            Map<String, Double> vec = new HashMap<>();
+            int maxf = tf.values().stream().max(Integer::compare).orElse(1);
+            for (var e : tf.entrySet()) {
+                double tfNorm = 0.5 + 0.5 * (e.getValue() / (double) maxf); // augmented tf
+                double idfVal = idf.getOrDefault(e.getKey(), 1.0);
+                vec.put(e.getKey(), tfNorm * idfVal);
+            }
+            return vec;
+        }
+
+        private static double cosine(Map<String, Double> a, Map<String, Double> b) {
+            Set<String> keys = new HashSet<>(a.keySet());
+            keys.retainAll(b.keySet());
+            double dot = 0;
+            for (String k : keys) dot += a.get(k) * b.get(k);
+            double na = Math.sqrt(a.values().stream().mapToDouble(v -> v * v).sum());
+            double nb = Math.sqrt(b.values().stream().mapToDouble(v -> v * v).sum());
+            if (na == 0 || nb == 0) return 0;
+            return dot / (na * nb);
+        }
+
+        private static String escape(String s) {
+            String out = s.replace("\"", "\"\"");
+            if (out.contains(",") || out.contains("\"") || out.contains("\n")) {
+                out = "\"" + out + "\"";
+            }
+            return out;
+        }
+
+        private static String[] unescapeCsv(String line) {
+            // Minimal CSV parser for two columns
+            List<String> cols = new ArrayList<>();
+            StringBuilder sb = new StringBuilder();
+            boolean inQuotes = false;
+            for (int i = 0; i < line.length(); i++) {
+                char c = line.charAt(i);
+                if (inQuotes) {
+                    if (c == '\"') {
+                        if (i + 1 < line.length() && line.charAt(i + 1) == '\"') {
+                            sb.append('\"'); i++;
+                        } else {
+                            inQuotes = false;
+                        }
+                    } else sb.append(c);
+                } else {
+                    if (c == '\"') inQuotes = true;
+                    else if (c == ',') { cols.add(sb.toString()); sb.setLength(0); }
+                    else sb.append(c);
+                }
+            }
+            cols.add(sb.toString());
+            return cols.toArray(new String[0]);
+        }
+    }
+
+    record FAQResult(String question, String answer, double similarity) {}
+
+    // ================== Simple NLP ==================
+
+    static class NLP {
+        private final Set<String> stop = new HashSet<>(Arrays.asList(
+                "a","an","the","and","or","but","if","then","than","to","for","of","on","in","at","by",
+                "is","are","was","were","be","been","being","it","its","this","that","these","those",
+                "with","as","from","about","into","over","under","again","further","more","most",
+                "so","such","not","no","do","does","did","doing","can","could","should","would","will",
+                "have","has","had","i","you","he","she","we","they","my","your","our","their"));
+
+        List<String> tokens(String text) {
+            String lower = text.toLowerCase(Locale.ROOT);
+            String cleaned = lower.replaceAll("[^a-z0-9\\s]", " ");
+            String[] parts = cleaned.trim().split("\\s+");
+            List<String> toks = new ArrayList<>();
+            for (String p : parts) {
+                if (p.isEmpty()) continue;
+                if (!stop.contains(p)) toks.add(p);
+            }
+            return toks;
+        }
+
+        boolean containsAny(String text, List<String> needles) {
+            String lower = text.toLowerCase(Locale.ROOT);
+            for (String n : needles) {
+                if (lower.contains(n.toLowerCase(Locale.ROOT))) return true;
+            }
+            return false;
+        }
+    }
+
+    // ================== Simple Math Parser ==================
+
+    static class SimpleMath {
+        // very small expression evaluator for + - * / and parentheses
+        static double eval(String expr) {
+            return new Object() {
+                int pos = -1, ch;
+
+                void nextChar() { ch = (++pos < expr.length()) ? expr.charAt(pos) : -1; }
+                boolean eat(int c) { while (ch == ' ') nextChar(); if (ch == c) { nextChar(); return true; } return false; }
+
+                double parse() {
+                    nextChar();
+                    double x = parseExpression();
+                    if (pos < expr.length()) throw new RuntimeException("Unexpected: " + (char)ch);
+                    return x;
+                }
+                double parseExpression() {
+                    double x = parseTerm();
+                    for (;;) {
+                        if (eat('+')) x += parseTerm();
+                        else if (eat('-')) x -= parseTerm();
+                        else return x;
+                    }
+                }
+                double parseTerm() {
+                    double x = parseFactor();
+                    for (;;) {
+                        if (eat('*')) x *= parseFactor();
+                        else if (eat('/')) x /= parseFactor();
+                        else return x;
+                    }
+                }
+                double parseFactor() {
+                    if (eat('+')) return parseFactor();
+                    if (eat('-')) return -parseFactor();
+
+                    double x;
+                    int startPos = this.pos;
+                    if (eat('(')) {
+                        x = parseExpression();
+                        if (!eat(')')) throw new RuntimeException("Missing ')'");
+                    } else if ((ch >= '0' && ch <= '9') || ch == '.') {
+                        while ((ch >= '0' && ch <= '9') || ch == '.') nextChar();
+                        x = Double.parseDouble(expr.substring(startPos, this.pos));
+                    } else {
+                        throw new RuntimeException("Unexpected: " + (char) ch);
+                    }
+                    return x;
+                }
+            }.parse();
+        }
+    }
+
+    // ================== Utils ==================
+    private static String stripTrailingZeros(double v) {
+        String s = String.format(Locale.US, "%.12f", v);
+        s = s.replaceAll("\\.?0+$", "");
+        return s;
+    }
+}
